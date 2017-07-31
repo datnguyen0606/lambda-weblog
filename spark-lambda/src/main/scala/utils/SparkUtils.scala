@@ -17,6 +17,7 @@ object SparkUtils {
     // get spark configuration
     val conf = new SparkConf()
       .setAppName(appName)
+      .set("spark.casandra.connection.host", "localhost")
 
     // Check if running from IDE
     if (isIDE) {

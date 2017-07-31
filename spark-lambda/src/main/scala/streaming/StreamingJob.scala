@@ -13,7 +13,11 @@ import config.Settings
 import kafka.common.TopicAndPartition
 import kafka.message.MessageAndMetadata
 import org.apache.spark.sql.SaveMode
-import org.apache.spark.storage.StorageLevel
+
+import com.datastax.spark.connector._
+import com.datastax.spark.connector.streaming._
+
+import scala.util.Try
 
 
 object StreamingJob {
@@ -36,14 +40,15 @@ object StreamingJob {
         "auto.offset.reset" -> "largest"
       )
 
+      var fromOffsets : Map[TopicAndPartition, Long] = Map.empty
       val hdfsPath = wlc.hdfsPath
-      val hdfsData = sqlContext.read.parquet(hdfsPath)
 
-      val fromOffsets = hdfsData.groupBy("topic", "kafkaPartition").agg(max("untilOffset").as("untilOffset"))
-        .collect().map{ row =>
-        (TopicAndPartition(row.getAs[String]("topic"), row.getAs[Int]("kafkaPartition")), row.getAs[String]("untilOffset").toLong + 1)
-      }.toMap
-
+      Try(sqlContext.read.parquet(hdfsPath)).foreach( hdfsData =>
+        fromOffsets = hdfsData.groupBy("topic", "kafkaPartition").agg(max("untilOffset").as("untilOffset"))
+          .collect().map { row =>
+          (TopicAndPartition(row.getAs[String]("topic"), row.getAs[Int]("kafkaPartition")), row.getAs[String]("untilOffset").toLong + 1)
+        }.toMap
+      )
 
       val kafkaDirectStream = fromOffsets.isEmpty match {
         case true =>
@@ -52,7 +57,7 @@ object StreamingJob {
           )
         case false =>
           KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder, (String, String)](
-            ssc, kafkaDirectParams, fromOffsets, { mmd : MessageAndMetadata[String, String] => (mmd.key(), mmd.message()) }
+            ssc, kafkaDirectParams, fromOffsets, { mmd: MessageAndMetadata[String, String] => (mmd.key(), mmd.message()) }
           )
       }
 
@@ -61,7 +66,7 @@ object StreamingJob {
       }).cache()
 
       // save data to HDFS
-      activityStream.foreachRDD{ rdd =>
+      activityStream.foreachRDD { rdd =>
         val activityDF = rdd
           .toDF()
           .selectExpr("timestamp_hour", "referrer", "action", "prevPage", "page", "visitor", "product", "inputProps.topic as topic", "inputProps.kafkaPartition as kafkaPartition", "inputProps.fromOffset as fromOffset", "inputProps.untilOffset as untilOffset")
@@ -103,11 +108,11 @@ object StreamingJob {
         .reduceByKeyAndWindow(
           (a, b) => b,
           (x, y) => x,
-          Seconds(30 / 4 * 4),
-          filterFunc = (record) => false
-        )
-        .foreachRDD(rdd => rdd.map(sr => ActivityByProduct(sr._1._1, sr._1._2, sr._2._1, sr._2._2, sr._2._3))
-          .toDF().registerTempTable("ActivityByProduct"))
+          Seconds(30 / 4 * 4)
+        ) // only save or expose the snapshot every x seconds
+        .map(sr => ActivityByProduct(sr._1._1, sr._1._2, sr._2._1, sr._2._2, sr._2._3))
+        .saveToCassandra("lambda", "stream_activity_by_product")
+
 
 
       // unique visitors by product
@@ -116,21 +121,26 @@ object StreamingJob {
           .function(mapVisitorsStateFunc)
           .timeout(Minutes(120))
 
-      val statefulVisitorsByProduct = activityStream.map( a => {
+      val statefulVisitorsByProduct = activityStream.map(a => {
         val hll = new HyperLogLogMonoid(12)
         ((a.product, a.timestamp_hour), hll(a.visitor.getBytes))
-      } ).mapWithState(visitorStateSpec)
+      }).mapWithState(visitorStateSpec)
 
       val visitorStateSnapshot = statefulVisitorsByProduct.stateSnapshots()
       visitorStateSnapshot
         .reduceByKeyAndWindow(
           (a, b) => b,
           (x, y) => x,
-          Seconds(30 / 4 * 4),
-          filterFunc = (record) => false
+          Seconds(30 / 4 * 4)
         ) // only save or expose the snapshot every x seconds
-        .foreachRDD(rdd => rdd.map(sr => VisitorsByProduct(sr._1._1, sr._1._2, sr._2.approximateSize.estimate))
-        .toDF().registerTempTable("VisitorsByProduct"))
+        .map(sr => VisitorsByProduct(sr._1._1, sr._1._2, sr._2.approximateSize.estimate))
+        .saveToCassandra("lambda", "stream_visitors_by_product")
+
+      /*.foreachRDD(rdd =>
+      rdd
+        .map(sr => VisitorsByProduct(sr._1._1, sr._1._2, sr._2.approximateSize.estimate))
+        //.toDF().registerTempTable("VisitorsByProduct")
+    )*/
 
       ssc
     }

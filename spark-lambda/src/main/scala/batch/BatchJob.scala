@@ -5,9 +5,7 @@ import org.apache.spark.sql.SaveMode
 import domain._
 import utils.SparkUtils._
 
-/**
-  * Created by Ahmad Alkilani on 5/1/2016.
-  */
+
 object BatchJob {
   def main (args: Array[String]): Unit = {
 
@@ -15,9 +13,6 @@ object BatchJob {
     val sc = getSparkContext("Lambda with Spark")
     val sqlContext = getSQLContext(sc)
     val wlc = Settings.WebLogGen
-
-    import org.apache.spark.sql.functions._
-    import sqlContext.implicits._
 
     // initialize input RDD
     val inputDF = sqlContext.read.parquet(wlc.hdfsPath)
@@ -29,6 +24,12 @@ object BatchJob {
         |FROM activity GROUP BY product, timestamp_hour
       """.stripMargin)
 
+    visitorsByProduct
+      .write
+      .format("org.apache.spark.sql.cassandra")
+      .options(Map( "keyspace" -> "lambda", "table" -> "batch_visitors_by_product"))
+      .save()
+
     val activityByProduct = sqlContext.sql("""SELECT
                                             product,
                                             timestamp_hour,
@@ -38,10 +39,10 @@ object BatchJob {
                                             from activity
                                             group by product, timestamp_hour """).cache()
 
-    activityByProduct.write.partitionBy("timestamp_hour").mode(SaveMode.Append).parquet("hdfs://lambda-pluralsight:9000/lambda/batch1")
-
-    visitorsByProduct.foreach(println)
-    activityByProduct.foreach(println)
-
+    activityByProduct
+      .write
+      .format("org.apache.spark.sql.cassandra")
+      .options(Map( "keyspace" -> "lambda", "table" -> "batch_activity_by_product"))
+      .save()
   }
 }
